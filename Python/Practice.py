@@ -1,10 +1,12 @@
 import argparse
 import json
+import os
 import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
 from pathlib import Path
 
 import psycopg
+from dotenv import load_dotenv
 from psycopg.rows import dict_row
 
 
@@ -20,22 +22,17 @@ class Database:
         with self._conn.cursor() as cur:
             cur.executemany(sql, rows)
 
-    def fetch_all(self, sql):
+    def fetch_all(self, sql, params=None):
         with self._conn.cursor() as cur:
-            cur.execute(sql)
+            cur.execute(sql, params)
             return cur.fetchall()
 
-    def commit(self):
-        self._conn.commit()
-
-    def close(self):
-        self._conn.close()
-
     def __enter__(self):
+        self._conn.__enter__()
         return self
 
     def __exit__(self, *exc):
-        self.close()
+        return self._conn.__exit__(*exc)
 
 
 class JsonReader:
@@ -65,11 +62,9 @@ class DataSchema:
                 sex CHAR(1) CHECK (sex IN ('M', 'F'))
             );
         """)
-        self._db.commit()
 
     def apply_indexes(self, sql_path: Path):
         self._db.execute(sql_path.read_text(encoding="utf-8"))
-        self._db.commit()
 
 
 class DataLoader:
@@ -81,14 +76,12 @@ class DataLoader:
             "INSERT INTO rooms (id, name) VALUES (%s, %s)",
             [(r["id"], r["name"]) for r in rooms],
         )
-        self._db.commit()
 
     def load_students(self, students: list[dict]):
         self._db.executemany(
             "INSERT INTO students (id, name, birthday, sex, room) VALUES (%s, %s, %s, %s, %s)",
             [(s["id"], s["name"], s["birthday"], s["sex"], s["room"]) for s in students],
         )
-        self._db.commit()
 
 
 class Queries:
@@ -105,7 +98,7 @@ class Queries:
         """)
 
     def min_avg_age(self):
-        return self._db.fetch_all(f"""
+        return self._db.fetch_all("""
             SELECT r.id, r.name AS room_name,
                    ROUND(AVG(EXTRACT(YEAR FROM AGE(s.birthday))), 2)::float AS avg_age
             FROM rooms r
@@ -116,7 +109,7 @@ class Queries:
         """)
 
     def max_age_diff(self):
-        return self._db.fetch_all(f"""
+        return self._db.fetch_all("""
             SELECT r.id, r.name AS room_name,
                    (MAX(EXTRACT(YEAR FROM AGE(s.birthday)))
                   - MIN(EXTRACT(YEAR FROM AGE(s.birthday))))::float AS age_difference
@@ -198,14 +191,27 @@ def parse_args():
     p.add_argument("--output", type=Path, help="путь к results.json или results.xml (по умолчанию в текущей папке)")
     return p.parse_args()
 
+def load_db_params() -> dict:
+    """Читает параметры подключения к БД из переменных окружения (.env)."""
+    load_dotenv()
+    required = ("DB_NAME", "DB_USER", "DB_PASSWORD", "DB_HOST", "DB_PORT")
+    missing = [name for name in required if not os.getenv(name)]
+    if missing:
+        raise SystemExit(f"Не заданы переменные окружения: {', '.join(missing)}")
+    return {
+        "dbname": os.environ["DB_NAME"],
+        "user": os.environ["DB_USER"],
+        "password": os.environ["DB_PASSWORD"],
+        "host": os.environ["DB_HOST"],
+        "port": int(os.environ["DB_PORT"]),
+    }
 
 def main():
     args = parse_args()
     base = Path(__file__).parent
     output = args.output or base / f"results.{args.format}"
 
-    with Database(dbname="test_db", user="admin", password="admin",
-                  host="localhost", port=5432) as db:
+    with Database(**load_db_params()) as db:
         service = ReportService(db, EXPORTERS[args.format]())
         service.run(args.rooms, args.students, base / "indexes.sql", output)
 
