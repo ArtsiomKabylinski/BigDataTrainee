@@ -4,34 +4,38 @@ import pandas as pd
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.mongo.hooks.mongo import MongoHook
-from airflow.datasets import Dataset
-
-PROCESSED_DATA_DATASET = Dataset("/opt/airflow/data/output.csv")
-
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUTPUT_FILE = os.path.join(BASE_DIR, "data", "output.csv")
+from utils.config import PROCESSED_DATA_DATASET,logger, OUTPUT_FILE_FINAL
+from pymongo.errors import BulkWriteError
 
 def load_csv_to_mongo():
-    if not os.path.exists(OUTPUT_FILE):
-        raise FileNotFoundError(f"Файл не найден: {OUTPUT_FILE}")
+    if not os.path.exists(OUTPUT_FILE_FINAL):
+        raise FileNotFoundError(f"File not found: {OUTPUT_FILE_FINAL}")
         
-    df = pd.read_csv(OUTPUT_FILE)
+    df = pd.read_csv(OUTPUT_FILE_FINAL)
     records = df.to_dict('records')
     
     if not records:
-        print("Файл не содержит записей.")
+        logger.info("File is empty.")
         return
 
+    for r in records:
+        r.pop("_id", None)
+        
     hook = MongoHook(mongo_conn_id="mongo_default")
     
-    client = hook.get_conn()
-    db = client.get_database()
-    collection = db["comments"]
-    
-    result = collection.insert_many(records)
-    print(f"Успешно загружено {len(result.inserted_ids)} документов в MongoDB.")
-    
-    client.close()
+    with hook.get_conn() as client:
+        db = client.get_database()
+        collection = db["comments"]
+        try:
+            result = collection.insert_many(records, ordered=False)
+            logger.info("Successfully loaded %d documents into MongoDB.",len(result.inserted_ids))
+        except BulkWriteError as e:
+            inserted = e.details.get("nInserted", 0)
+            dup_errors = [
+                err for err in e.details.get("writeErrors", [])
+                if err.get("code") == 11000
+            ]
+            logger.warning("Inserted %d documents, skipped %d duplicates.",inserted,len(dup_errors))
 
 with DAG(
     dag_id="2_load_to_mongodb",

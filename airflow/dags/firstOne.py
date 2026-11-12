@@ -4,50 +4,61 @@ import os
 import pandas as pd
 import re
 from airflow import DAG
-from airflow.decorators import task
 from airflow.sensors.filesystem import FileSensor
 from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
 from airflow.utils.task_group import TaskGroup
-from airflow.datasets import Dataset
-
-PROCESSED_DATA_DATASET = Dataset("/opt/airflow/data/output.csv")
-
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-INPUT_FILE = os.path.join(BASE_DIR, "data", "tiktok_google_play_reviews.csv")
-OUTPUT_FILE = os.path.join(BASE_DIR, "data", "output.csv")
+from airflow.operators.python import BranchPythonOperator
+from utils.config import INPUT_FILE, OUTPUT_FILE_1, PROCESSED_DATA_DATASET, logger, OUTPUT_FILE_FINAL, OUTPUT_FILE_2
 
 def replace_nulls_func():
     if not os.path.exists(INPUT_FILE):
-        raise FileNotFoundError(f"Файл не найден: {INPUT_FILE}")
-    df = pd.read_csv(INPUT_FILE)
-    df = df.replace(['null', 'NULL', 'None', None], '-')
+        raise FileNotFoundError(f"File not found: {INPUT_FILE}")
+    df = pd.read_csv(INPUT_FILE, keep_default_na=False, na_values=[])
+    df = df.replace(['null', 'NULL', 'None', 'none', 'NONE', ''], '-')
     df = df.fillna('-')
-    df.to_csv(OUTPUT_FILE, index=False)
-    print("Nulls replaced.")
+    df.to_csv(OUTPUT_FILE_1, index=False)
+    logger.info("Nulls replaced.")
+
+def check_file_empty() -> str:
+    try:
+        df = pd.read_csv(INPUT_FILE, nrows=1)
+        if df.empty:
+            logger.info("File is empty.")
+            return "log_empty_file"
+            
+    except pd.errors.EmptyDataError:
+        logger.info("File is completely empty (0 bytes).")
+        return "log_empty_file"
+    except FileNotFoundError:
+        logger.error(f"File not found: {INPUT_FILE}")
+        return "log_empty_file"
+    
+    logger.info("File is not empty. Proceeding with processing.")
+    return "transform_group.replace_nulls"
 
 def sort_data_func():
-    if not os.path.exists(OUTPUT_FILE):
-        raise FileNotFoundError(f"Файл не найден: {OUTPUT_FILE}")
-    df = pd.read_csv(OUTPUT_FILE)
+    if not os.path.exists(OUTPUT_FILE_1):
+        raise FileNotFoundError(f"File not found: {OUTPUT_FILE_1}")
+    df = pd.read_csv(OUTPUT_FILE_1)
     if 'created_date' in df.columns:
         df["created_date"] = pd.to_datetime(
             df["created_date"], errors="coerce"
         )
         df = df.sort_values(by="created_date")
-    df.to_csv(OUTPUT_FILE, index=False)
-    print("Data sorted by created_date.")
+    df.to_csv(OUTPUT_FILE_2, index=False)
+    logger.info("Data sorted by created_date.")
 
 def clean_content_func():
-    if not os.path.exists(OUTPUT_FILE):
-        raise FileNotFoundError(f"Файл не найден: {OUTPUT_FILE}")
-    df = pd.read_csv(OUTPUT_FILE)
+    if not os.path.exists(OUTPUT_FILE_2):
+        raise FileNotFoundError(f"File not found: {OUTPUT_FILE_2}")
+    df = pd.read_csv(OUTPUT_FILE_2)
     if 'content' in df.columns:
         df['content'] = df['content'].astype(str).apply(
             lambda x: re.sub(r"[^\w\s.,!?;:'-]", "", x)
         )
-    df.to_csv(OUTPUT_FILE, index=False)
-    print("Content cleaned.")
+    df.to_csv(OUTPUT_FILE_FINAL, index=False)
+    logger.info("Content cleaned.")
 
 with DAG(
     dag_id="1_process_csv_file",
@@ -65,17 +76,14 @@ with DAG(
         mode="reschedule",
     )
 
-    @task.branch(task_id="check_file_empty")
-    def check_file_empty() -> str:
-        if not os.path.exists(INPUT_FILE) or os.path.getsize(INPUT_FILE) == 0:
-            return "log_empty_file"
-        return "transform_group.replace_nulls"
-
-    branch_task = check_file_empty()
+    check_file_emptynes = BranchPythonOperator(
+        task_id="check_file_empty",
+        python_callable=check_file_empty
+    )
 
     log_empty_file = BashOperator(
         task_id="log_empty_file",
-        bash_command='echo "Внимание: Файл пустой. Обработка остановлена."',
+        bash_command='echo "Warning: File is empty. Processing stopped."',
     )
 
     with TaskGroup("transform_group") as transform_group:
@@ -98,7 +106,7 @@ with DAG(
         t1_replace >> t2_sort >> t3_clean
 
 
-    wait_for_file >> branch_task
-    branch_task >> log_empty_file
-    branch_task >> transform_group
+    wait_for_file >> check_file_emptynes
+    check_file_emptynes >> log_empty_file
+    check_file_emptynes >> transform_group
     
